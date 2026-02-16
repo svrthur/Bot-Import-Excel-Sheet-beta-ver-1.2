@@ -50,6 +50,19 @@ export async function setupBot() {
           
           if (scriptRes.data.status === 'success') {
             ctx.reply('Готово! Ячейки в таблице отмечены.');
+            
+            // Проверка порогов после обновления
+            try {
+              // Ждем немного, чтобы Google обновил данные
+              await new Promise(resolve => setTimeout(resolve, 2000));
+              const checkRes = await axios.get(APPS_SCRIPT_URL);
+              if (checkRes.data.status === 'success' && checkRes.data.exceeded && checkRes.data.exceeded.length > 0) {
+                const list = checkRes.data.exceeded.join(', ');
+                ctx.reply(`⚠️ Внимание! В ТК № ${list} превышен порог в 160 секунд!`);
+              }
+            } catch (checkErr) {
+              console.error('Ошибка проверки порогов:', checkErr);
+            }
           } else {
             ctx.reply(`Ошибка от Google: ${scriptRes.data.message || 'неизвестная ошибка'}`);
           }
