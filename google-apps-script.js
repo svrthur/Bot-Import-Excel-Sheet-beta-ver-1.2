@@ -1,216 +1,408 @@
+/**
+ * ==========================
+ * КАЛЕНДАРЬ РОЛИКОВ — ПОЛНЫЙ СКРИПТ
+ * ==========================
+ * Часть 1 (ваш оригинал):
+ *   — onEdit: пересчёт строки 2 при изменении N7
+ *   — recolorExpiredByToday: перекрашивает просроченные зелёные → красные
+ *   — recalcTotalsByN7: ручной пересчёт
+ *
+ * Часть 2 (Telegram-бот):
+ *   — doPost / highlightCampaigns: подсветка ячеек зелёным по команде из бота
+ *   — doGet: проверка порога 160 с (для алертов бота); ?action=calculate → пересчёт строки 2
+ *   — hideFinishedCampaigns: скрытие завершённых кампаний (запускать по триггеру)
+ *   — checkTKThreshold: возвращает список ТК, превысивших 160 с
+ */
+
+// ─────────────────────────────────────────────
+// КОНФИГУРАЦИЯ
+// ─────────────────────────────────────────────
+const CFG = {
+  SHEET_NAME: 'Лист1',
+
+  // ТК: R..GN
+  TK_START_COL: 18,
+  TK_END_COL: 196,
+
+  TOTALS_ROW: 2,
+  DATA_START_ROW: 3,
+
+  DATE_CELL_A1: 'N7',
+
+  // A Название, B Тип, C Длит-ть, D Владелец, E Статус, F Дата старта, G Дата окончания
+  DURATION_COL: 3, // C
+  STATUS_COL: 5,   // E
+  START_COL: 6,    // F
+  END_COL: 7,      // G
+
+  // Цвета
+  GREEN_HEXES: ['#00ff00'],
+  RED_HEX: '#ff0000',
+
+  // Тексты статусов (как в таблице; регистр не важен)
+  STATUS_PLANNED:   'запланировано',
+  STATUS_PUBLISHED: 'опубликовано',
+  STATUS_DONE:      'завершено',
+
+  SPREADSHEET_ID: '17VeQQWTGotofrpNbUHDhUFhCc3qjLdwoesTxDDfJ7h4',
+};
+
+// ─────────────────────────────────────────────
+// ЧАСТЬ 1 — ВАШИ ФУНКЦИИ (без изменений)
+// ─────────────────────────────────────────────
+
+/**
+ * onEdit — пересчёт итогов при изменении N7
+ */
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    const sh = e.range.getSheet();
+    if (sh.getName() !== CFG.SHEET_NAME) return;
+
+    if (e.range.getA1Notation() !== CFG.DATE_CELL_A1) return;
+
+    const selectedDate = toDate00_(sh.getRange(CFG.DATE_CELL_A1).getValue());
+    if (!selectedDate) return;
+
+    recalcTotalsRow_(sh, selectedDate);
+  } catch (err) {
+    console.error('onEdit error:', err);
+  }
+}
+
+/**
+ * Задача 1 — перекраска по "сегодня"
+ */
+function recolorExpiredByToday() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_NAME);
+  if (!sh) throw new Error(`Лист "${CFG.SHEET_NAME}" не найден`);
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  recolorExpiredGreenToRed_(sh, today);
+}
+
+function createDailyRecolorTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const t of triggers) {
+    if (t.getHandlerFunction() === 'recolorExpiredByToday') ScriptApp.deleteTrigger(t);
+  }
+
+  ScriptApp.newTrigger('recolorExpiredByToday')
+    .timeBased()
+    .everyDays(1)
+    .atHour(2)
+    .create();
+}
+
+/**
+ * Ручной пересчёт по N7 (для теста)
+ */
+function recalcTotalsByN7() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_NAME);
+  if (!sh) throw new Error(`Лист "${CFG.SHEET_NAME}" не найден`);
+
+  const selectedDate = toDate00_(sh.getRange(CFG.DATE_CELL_A1).getValue());
+  if (!selectedDate) throw new Error('В N7 не дата (или формат не распознан)');
+
+  recalcTotalsRow_(sh, selectedDate);
+}
+
+/**
+ * ВНУТРЕННЯЯ: перекраска просроченных зелёных → красный
+ */
+function recolorExpiredGreenToRed_(sh, compareDate) {
+  const lastRow = sh.getLastRow();
+  if (lastRow < CFG.DATA_START_ROW) return;
+
+  const numRows = lastRow - CFG.DATA_START_ROW + 1;
+  const numCols = CFG.TK_END_COL - CFG.TK_START_COL + 1;
+
+  const endVals = sh.getRange(CFG.DATA_START_ROW, CFG.END_COL, numRows, 1).getValues();
+
+  const tkRange = sh.getRange(CFG.DATA_START_ROW, CFG.TK_START_COL, numRows, numCols);
+  const bgs = tkRange.getBackgrounds();
+
+  let changed = false;
+
+  for (let r = 0; r < numRows; r++) {
+    const endDate = toDate00_(endVals[r][0]);
+    if (!endDate) continue;
+
+    if (compareDate.getTime() <= endDate.getTime()) continue;
+
+    for (let c = 0; c < numCols; c++) {
+      if (isGreen_(bgs[r][c])) {
+        bgs[r][c] = CFG.RED_HEX;
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) tkRange.setBackgrounds(bgs);
+}
+
+/**
+ * ВНУТРЕННЯЯ: итоги хронометража для строки 2
+ */
+function recalcTotalsRow_(sh, selectedDate) {
+  const lastRow = sh.getLastRow();
+  if (lastRow < CFG.DATA_START_ROW) {
+    clearTotalsRow_(sh);
+    return;
+  }
+
+  const numRows = lastRow - CFG.DATA_START_ROW + 1;
+  const numCols = CFG.TK_END_COL - CFG.TK_START_COL + 1;
+
+  const durations = sh.getRange(CFG.DATA_START_ROW, CFG.DURATION_COL, numRows, 1).getValues();
+  const statuses  = sh.getRange(CFG.DATA_START_ROW, CFG.STATUS_COL,   numRows, 1).getDisplayValues();
+  const starts    = sh.getRange(CFG.DATA_START_ROW, CFG.START_COL,    numRows, 1).getValues();
+  const ends      = sh.getRange(CFG.DATA_START_ROW, CFG.END_COL,      numRows, 1).getValues();
+
+  const tkRange = sh.getRange(CFG.DATA_START_ROW, CFG.TK_START_COL, numRows, numCols);
+  const bgs = tkRange.getBackgrounds();
+
+  const totals = new Array(numCols).fill(0);
+
+  for (let r = 0; r < numRows; r++) {
+    const startDate = toDate00_(starts[r][0]);
+    const endDate   = toDate00_(ends[r][0]);
+    if (!startDate || !endDate) continue;
+
+    if (selectedDate.getTime() < startDate.getTime()) continue;
+    if (selectedDate.getTime() > endDate.getTime()) continue;
+
+    const effStatus = effectiveStatusOnDate_(statuses[r][0], startDate, endDate, selectedDate);
+    if (effStatus === CFG.STATUS_DONE) continue;
+
+    const sec = toNumber_(durations[r][0]);
+    if (!(sec > 0)) continue;
+
+    for (let c = 0; c < numCols; c++) {
+      if (isGreen_(bgs[r][c])) totals[c] += sec;
+    }
+  }
+
+  sh.getRange(CFG.TOTALS_ROW, CFG.TK_START_COL, 1, numCols).setValues([totals]);
+}
+
+function clearTotalsRow_(sh) {
+  const numCols = CFG.TK_END_COL - CFG.TK_START_COL + 1;
+  sh.getRange(CFG.TOTALS_ROW, CFG.TK_START_COL, 1, numCols).clearContent();
+}
+
+/**
+ * Эффективный статус на дату
+ */
+function effectiveStatusOnDate_(rawStatus, startDate, endDate, date) {
+  const st = normalizeStatus_(rawStatus);
+
+  if (st === CFG.STATUS_PLANNED || st === CFG.STATUS_PUBLISHED || st === CFG.STATUS_DONE) {
+    return st;
+  }
+
+  if (date.getTime() < startDate.getTime()) return CFG.STATUS_PLANNED;
+  if (date.getTime() > endDate.getTime()) return CFG.STATUS_DONE;
+  return CFG.STATUS_PUBLISHED;
+}
+
+// ─────────────────────────────────────────────
+// ВСПОМОГАТЕЛЬНЫЕ
+// ─────────────────────────────────────────────
+
+function normalizeStatus_(s) {
+  return (s || '').toString().trim().toLowerCase();
+}
+
+function isGreen_(hex) {
+  if (!hex) return false;
+  const h = String(hex).trim().toLowerCase();
+  return CFG.GREEN_HEXES.some(g => h === String(g).trim().toLowerCase());
+}
+
+function toNumber_(v) {
+  if (typeof v === 'number') return v;
+  if (v === null || v === undefined) return 0;
+  const n = Number(String(v).replace(',', '.').trim());
+  return isNaN(n) ? 0 : n;
+}
+
+function toDate00_(v) {
+  if (!v && v !== 0) return null;
+
+  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) {
+    const d = new Date(v);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  const s = String(v).trim();
+  if (!s) return null;
+
+  const m = s.match(/^(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{2}|\d{4})$/);
+  if (m) {
+    const dd = parseInt(m[1], 10);
+    const mm = parseInt(m[2], 10);
+    let yy = parseInt(m[3], 10);
+    if (yy < 100) yy += 2000;
+    const d = new Date(yy, mm - 1, dd);
+    if (!isNaN(d.getTime())) {
+      d.setHours(0, 0, 0, 0);
+      return d;
+    }
+  }
+
+  const d2 = new Date(s);
+  if (!isNaN(d2.getTime())) {
+    d2.setHours(0, 0, 0, 0);
+    return d2;
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────
+// ЧАСТЬ 2 — TELEGRAM-БОТ
+// ─────────────────────────────────────────────
+
+/**
+ * Открывает таблицу по ID (нужно для вызовов из бота/doGet/doPost,
+ * где SpreadsheetApp.getActive() недоступен).
+ */
+function getSheet_() {
+  const ss = SpreadsheetApp.openById(CFG.SPREADSHEET_ID);
+  return ss.getSheetByName(CFG.SHEET_NAME) || ss.getSheets()[0];
+}
+
+/**
+ * doPost — точка входа для POST-запросов от Telegram-бота.
+ * Тело запроса: { action: 'highlight', data: { '<rowNum>': ['ТК1','ТК2', ...] } }
+ */
 function doPost(e) {
   try {
-    var requestData = JSON.parse(e.postData.contents);
-    
+    const requestData = JSON.parse(e.postData.contents);
+
     if (requestData.action === 'highlight') {
       highlightCampaigns(requestData.data);
-      return ContentService.createTextOutput(JSON.stringify({status: 'success'}))
+      return ContentService.createTextOutput(JSON.stringify({ status: 'success' }))
         .setMimeType(ContentService.MimeType.JSON);
     }
+
+    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: 'Неизвестный action' }))
+      .setMimeType(ContentService.MimeType.JSON);
   } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({status: 'error', message: err.toString()}))
+    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: err.toString() }))
       .setMimeType(ContentService.MimeType.JSON);
   }
 }
 
-function highlightCampaigns(campaignData) {
-  var spreadsheetId = "17VeQQWTGotofrpNbUHDhUFhCc3qjLdwoesTxDDfJ7h4";
-  var ss = SpreadsheetApp.openById(spreadsheetId);
-  
-  if (!ss) {
-    throw new Error("Не удалось получить доступ к таблице по ID: " + spreadsheetId);
-  }
-
-  var sheet = ss.getSheets()[0];
-  var data = sheet.getDataRange().getValues();
-  
-  var headers = data[0]; 
-  var tkColMap = {};
-  for (var col = 0; col < headers.length; col++) {
-    var val = headers[col];
-    if (val !== null && val !== undefined) {
-      var tkValue = String(val).trim();
-      if (tkValue) {
-        tkColMap[tkValue] = col + 1;
-      }
-    }
-  }
-
-  for (var rowKey in campaignData) {
-    var tks = campaignData[rowKey];
-    var rowIndex = parseInt(rowKey.replace(/\D/g, ''));
-    
-    if (!isNaN(rowIndex) && rowIndex > 0) {
-      for (var j = 0; j < tks.length; j++) {
-        var tkNum = String(tks[j]).trim();
-        var colIndex = tkColMap[tkNum];
-        
-        if (colIndex) {
-          sheet.getRange(rowIndex, colIndex).setBackground("#00ff00");
-        }
-      }
-    }
-  }
-}
-
 /**
- * Подсчёт секунд по строке 2 для каждого ТК (R–GN).
- * Суммирует столбец C для строк, где:
- *   — ячейка ТК закрашена зелёным (#00ff00)
- *   — дата из N7 попадает в диапазон [Дата старта (F) .. Дата окончания (G)]
- *   — Статус (E) = "опубликовано" или "запланировано"
- * Записывает результат в строку 2 (R2:GN2).
- * Можно запускать вручную или по триггеру (например, каждый час).
+ * Закрашивает ячейки в зелёный (#00ff00) для переданных строк и ТК-кодов,
+ * затем пересчитывает строку 2.
+ * campaignData = { '234': ['203','227'], ... }
  */
-function calculateTKSeconds() {
-  var spreadsheetId = "17VeQQWTGotofrpNbUHDhUFhCc3qjLdwoesTxDDfJ7h4";
-  var ss = SpreadsheetApp.openById(spreadsheetId);
-  var sheet = ss.getSheets()[0];
+function highlightCampaigns(campaignData) {
+  const sh = getSheet_();
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
 
-  // Целевая дата из N7
-  var targetDateRaw = sheet.getRange("N7").getValue();
-  if (!(targetDateRaw instanceof Date) || isNaN(targetDateRaw.getTime())) {
-    Logger.log("Ошибка: ячейка N7 не содержит корректную дату.");
-    return { status: 'error', message: 'N7 не содержит дату' };
-  }
-  // Нормализуем до полуночи, чтобы сравнивать только по дням
-  var target = new Date(targetDateRaw.getFullYear(), targetDateRaw.getMonth(), targetDateRaw.getDate());
-
-  var lastRow = sheet.getLastRow();
-  var startRow = 3; // Данные кампаний начинаются с 3-й строки
-
-  if (lastRow < startRow) {
-    Logger.log("Нет данных для обработки.");
-    return { status: 'ok', message: 'Нет строк' };
+  // Карта: заголовок ТК → номер столбца (1-based)
+  const tkColMap = {};
+  for (let col = 0; col < headers.length; col++) {
+    const val = String(headers[col]).trim();
+    if (val) tkColMap[val] = col + 1;
   }
 
-  var numRows = lastRow - startRow + 1;
+  for (const rowKey in campaignData) {
+    const tks = campaignData[rowKey];
+    const rowIndex = parseInt(rowKey.replace(/\D/g, ''), 10);
+    if (isNaN(rowIndex) || rowIndex <= 0) continue;
 
-  // Колонки ТК: R=18 .. GN=195 (178 колонок)
-  var tkStartCol = 18;
-  var numTKCols = 178;
-
-  // Читаем все нужные данные одним блоком для скорости
-  // Секунды: столбец C (3)
-  var secondsData = sheet.getRange(startRow, 3, numRows, 1).getValues();
-
-  // Статус (E=5), Дата старта (F=6), Дата окончания (G=7) — 3 столбца начиная с E
-  var campaignData = sheet.getRange(startRow, 5, numRows, 3).getValues();
-
-  // Цвета фона для всего блока ТК-колонок
-  var backgrounds = sheet.getRange(startRow, tkStartCol, numRows, numTKCols).getBackgrounds();
-
-  var GREEN = "#00ff00";
-  // Допустимые статусы (в нижнем регистре)
-  var validStatuses = ["опубликовано", "запланировано"];
-
-  var totals = new Array(numTKCols).fill(0);
-
-  for (var row = 0; row < numRows; row++) {
-    var seconds = parseFloat(secondsData[row][0]);
-    if (isNaN(seconds) || seconds <= 0) continue;
-
-    var status = String(campaignData[row][0]).toLowerCase().trim();
-    if (validStatuses.indexOf(status) === -1) continue;
-
-    var rawStart = campaignData[row][1];
-    var rawEnd   = campaignData[row][2];
-    if (!(rawStart instanceof Date) || !(rawEnd instanceof Date)) continue;
-
-    var startDate = new Date(rawStart.getFullYear(), rawStart.getMonth(), rawStart.getDate());
-    var endDate   = new Date(rawEnd.getFullYear(),   rawEnd.getMonth(),   rawEnd.getDate());
-
-    // Дата N7 должна попадать в [startDate, endDate]
-    if (target < startDate || target > endDate) continue;
-
-    // Проверяем каждую ТК-колонку на зелёный цвет
-    for (var col = 0; col < numTKCols; col++) {
-      if (backgrounds[row][col].toLowerCase() === GREEN) {
-        totals[col] += seconds;
+    for (let j = 0; j < tks.length; j++) {
+      const tkNum = String(tks[j]).trim();
+      const colIndex = tkColMap[tkNum];
+      if (colIndex) {
+        sh.getRange(rowIndex, colIndex).setBackground(CFG.GREEN_HEXES[0]);
       }
     }
   }
 
-  // Записываем результаты в строку 2 (R2:GN2)
-  sheet.getRange(2, tkStartCol, 1, numTKCols).setValues([totals]);
-
-  Logger.log("calculateTKSeconds завершён. Дата: " + target + " | Итого колонок: " + numTKCols);
-  return { status: 'success', date: target.toString() };
+  // После подсветки пересчитываем строку 2 по дате из N7
+  const selectedDate = toDate00_(sh.getRange(CFG.DATE_CELL_A1).getValue());
+  if (selectedDate) recalcTotalsRow_(sh, selectedDate);
 }
 
+/**
+ * Скрывает строки с кампаниями, у которых статус "завершено"
+ * и дата окончания более 24 ч назад. Запускать по time-driven триггеру.
+ */
 function hideFinishedCampaigns() {
-  var spreadsheetId = "17VeQQWTGotofrpNbUHDhUFhCc3qjLdwoesTxDDfJ7h4";
-  var ss = SpreadsheetApp.openById(spreadsheetId);
-  var sheet = ss.getSheets()[0];
-  
-  var startRow = 120;
-  var statusCol = 5; 
-  
-  var lastRow = sheet.getLastRow();
+  const sh = getSheet_();
+  const startRow = 120;
+  const lastRow  = sh.getLastRow();
   if (lastRow < startRow) return;
-  
-  var range = sheet.getRange(startRow, statusCol, lastRow - startRow + 1, 1);
-  var values = range.getValues();
-  
-  var now = new Date().getTime();
-  var twentyFourHours = 24 * 60 * 60 * 1000;
-  
-  for (var i = 0; i < values.length; i++) {
-    var rowNum = startRow + i;
-    var status = String(values[i][0]).toLowerCase().trim();
-    
-    if (status === "завершено") {
-      var endDateVal = sheet.getRange(rowNum, 9).getValue();
-      if (endDateVal instanceof Date) {
-        if (now - endDateVal.getTime() > twentyFourHours) {
-          sheet.hideRows(rowNum);
-        }
-      }
+
+  const statusRange = sh.getRange(startRow, CFG.STATUS_COL, lastRow - startRow + 1, 1);
+  const values = statusRange.getValues();
+  const now = Date.now();
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  for (let i = 0; i < values.length; i++) {
+    const rowNum = startRow + i;
+    if (normalizeStatus_(values[i][0]) !== CFG.STATUS_DONE) continue;
+
+    const endDateVal = sh.getRange(rowNum, CFG.END_COL).getValue();
+    if (endDateVal instanceof Date && (now - endDateVal.getTime()) > DAY_MS) {
+      sh.hideRows(rowNum);
     }
   }
 }
 
 /**
- * Проверка превышения порога 160 секунд в строке 2.
+ * Проверяет строку 2 (R2:GN2): возвращает массив ТК, где значение > 160 с.
+ * Используется ботом для предупреждений.
  */
 function checkTKThreshold() {
-  var spreadsheetId = "17VeQQWTGotofrpNbUHDhUFhCc3qjLdwoesTxDDfJ7h4";
-  var ss = SpreadsheetApp.openById(spreadsheetId);
-  var sheet = ss.getSheets()[0];
-  
-  var range = sheet.getRange(2, 18, 1, 178);
-  var values = range.getValues()[0];
-  var headers = sheet.getRange(1, 18, 1, 178).getValues()[0];
-  
-  var exceeded = [];
-  for (var i = 0; i < values.length; i++) {
-    var seconds = parseFloat(values[i]);
-    if (!isNaN(seconds) && seconds > 160) {
+  const sh = getSheet_();
+  const numCols = CFG.TK_END_COL - CFG.TK_START_COL + 1;
+
+  const values  = sh.getRange(CFG.TOTALS_ROW, CFG.TK_START_COL, 1, numCols).getValues()[0];
+  const headers = sh.getRange(1,              CFG.TK_START_COL, 1, numCols).getValues()[0];
+
+  const exceeded = [];
+  for (let i = 0; i < values.length; i++) {
+    const sec = parseFloat(values[i]);
+    if (!isNaN(sec) && sec > 160) {
       exceeded.push(String(headers[i]).trim());
     }
   }
-  
+
   return exceeded.length > 0 ? exceeded : null;
 }
 
 /**
- * GET-обработчик:
- *   ?action=calculate  — запускает подсчёт секунд и возвращает результат
- *   (по умолчанию)     — проверяет превышение порога 160 с
+ * doGet — точка входа для GET-запросов.
+ *   ?action=calculate  → пересчитать строку 2 по N7 и вернуть результат
+ *   (без параметра)    → проверить порог 160 с (для бота)
  */
 function doGet(e) {
-  var action = e && e.parameter && e.parameter.action;
+  const action = e && e.parameter && e.parameter.action;
 
   if (action === 'calculate') {
-    var result = calculateTKSeconds();
-    return ContentService.createTextOutput(JSON.stringify(result))
-      .setMimeType(ContentService.MimeType.JSON);
+    try {
+      recalcTotalsByN7();
+      return ContentService.createTextOutput(JSON.stringify({ status: 'success' }))
+        .setMimeType(ContentService.MimeType.JSON);
+    } catch (err) {
+      return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: err.toString() }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
   }
 
   // По умолчанию — проверка порогов
-  var exceeded = checkTKThreshold();
-  return ContentService.createTextOutput(JSON.stringify({
-    status: 'success',
-    exceeded: exceeded
-  })).setMimeType(ContentService.MimeType.JSON);
+  const exceeded = checkTKThreshold();
+  return ContentService.createTextOutput(JSON.stringify({ status: 'success', exceeded: exceeded }))
+    .setMimeType(ContentService.MimeType.JSON);
 }

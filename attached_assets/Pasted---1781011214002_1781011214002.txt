@@ -1,0 +1,290 @@
+/**
+ * ==========================
+ * КАЛЕНДАРЬ РОЛИКОВ — ГОТОВЫЙ СКРИПТ
+ * ==========================
+ * 1) Перекраска (по текущей дате/сегодня):
+ *    если сегодня > дата окончания (G), то зелёные #00ff00 в R..GN перекрасить в красный.
+ *
+ * 2) Хронометраж (по выбранной дате N7):
+ *    для каждого столбца R..GN посчитать сумму секунд (C) по зелёным ячейкам, если:
+ *      - N7 попадает в период F..G включительно
+ *      - эффективный статус на дату N7 НЕ "завершено"
+ *        (статус берётся из E, но если он не совпадает/пустой — вычисляется по F/G)
+ *
+ * Триггеры:
+ * - onEdit: реагирует только на правку N7 → пересчёт строки 2 (R2:GN2)
+ * - time-driven: createDailyRecolorTrigger() → ежедневно запускает recolorExpiredByToday()
+ */
+
+const CFG = {
+  SHEET_NAME: 'Лист1',
+
+  // ТК: R..GN
+  TK_START_COL: 18,
+  TK_END_COL: 196,
+
+  TOTALS_ROW: 2,
+  DATA_START_ROW: 3,
+
+  DATE_CELL_A1: 'N7',
+
+  // A Название, B Тип, C Длит-ть, D Владелец, E Статус, F Дата старта, G Дата окончания
+  DURATION_COL: 3, // C
+  STATUS_COL: 5,   // E
+  START_COL: 6,    // F
+  END_COL: 7,      // G
+
+  // Цвета
+  GREEN_HEXES: ['#00ff00'],
+  RED_HEX: '#ff0000',
+
+  // Тексты статусов (как в таблице; регистр не важен)
+  STATUS_PLANNED: 'запланировано',
+  STATUS_PUBLISHED: 'опубликовано',
+  STATUS_DONE: 'завершено',
+};
+
+/**
+ * ==========================
+ * onEdit — пересчёт итогов при изменении N7
+ * ==========================
+ */
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    const sh = e.range.getSheet();
+    if (sh.getName() !== CFG.SHEET_NAME) return;
+
+    if (e.range.getA1Notation() !== CFG.DATE_CELL_A1) return;
+
+    const selectedDate = toDate00_(sh.getRange(CFG.DATE_CELL_A1).getValue());
+    if (!selectedDate) return;
+
+    recalcTotalsRow_(sh, selectedDate);
+  } catch (err) {
+    console.error('onEdit error:', err);
+  }
+}
+
+/**
+ * ==========================
+ * Задача 1 — перекраска по "сегодня"
+ * ==========================
+ */
+function recolorExpiredByToday() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_NAME);
+  if (!sh) throw new Error(`Лист "${CFG.SHEET_NAME}" не найден`);
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  recolorExpiredGreenToRed_(sh, today);
+}
+
+function createDailyRecolorTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const t of triggers) {
+    if (t.getHandlerFunction() === 'recolorExpiredByToday') ScriptApp.deleteTrigger(t);
+  }
+
+  ScriptApp.newTrigger('recolorExpiredByToday')
+    .timeBased()
+    .everyDays(1)
+    .atHour(2)
+    .create();
+}
+
+/**
+ * ==========================
+ * Ручной пересчёт по N7 (для теста)
+ * ==========================
+ */
+function recalcTotalsByN7() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_NAME);
+  if (!sh) throw new Error(`Лист "${CFG.SHEET_NAME}" не найден`);
+
+  const selectedDate = toDate00_(sh.getRange(CFG.DATE_CELL_A1).getValue());
+  if (!selectedDate) throw new Error('В N7 не дата (или формат не распознан)');
+
+  recalcTotalsRow_(sh, selectedDate);
+}
+
+/**
+ * ==========================
+ * ВНУТРЕННЯЯ ЛОГИКА: перекраска
+ * ==========================
+ */
+function recolorExpiredGreenToRed_(sh, compareDate) {
+  const lastRow = sh.getLastRow();
+  if (lastRow < CFG.DATA_START_ROW) return;
+
+  const numRows = lastRow - CFG.DATA_START_ROW + 1;
+  const numCols = CFG.TK_END_COL - CFG.TK_START_COL + 1;
+
+  const endVals = sh.getRange(CFG.DATA_START_ROW, CFG.END_COL, numRows, 1).getValues();
+
+  const tkRange = sh.getRange(CFG.DATA_START_ROW, CFG.TK_START_COL, numRows, numCols);
+  const bgs = tkRange.getBackgrounds();
+
+  let changed = false;
+
+  for (let r = 0; r < numRows; r++) {
+    const endDate = toDate00_(endVals[r][0]);
+    if (!endDate) continue;
+
+    if (compareDate.getTime() <= endDate.getTime()) continue;
+
+    for (let c = 0; c < numCols; c++) {
+      if (isGreen_(bgs[r][c])) {
+        bgs[r][c] = CFG.RED_HEX;
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) tkRange.setBackgrounds(bgs);
+}
+
+/**
+ * ==========================
+ * ВНУТРЕННЯЯ ЛОГИКА: итоги хронометража
+ * ==========================
+ * Учитываем строку, если:
+ * - зелёная ячейка в R..GN
+ * - N7 в периоде F..G включительно
+ * - эффективный статус на дату N7 != "завершено"
+ */
+function recalcTotalsRow_(sh, selectedDate) {
+  const lastRow = sh.getLastRow();
+  if (lastRow < CFG.DATA_START_ROW) {
+    clearTotalsRow_(sh);
+    return;
+  }
+
+  const numRows = lastRow - CFG.DATA_START_ROW + 1;
+  const numCols = CFG.TK_END_COL - CFG.TK_START_COL + 1;
+
+  const durations = sh.getRange(CFG.DATA_START_ROW, CFG.DURATION_COL, numRows, 1).getValues();          // C
+  const statuses  = sh.getRange(CFG.DATA_START_ROW, CFG.STATUS_COL,   numRows, 1).getDisplayValues();   // E (текст)
+  const starts    = sh.getRange(CFG.DATA_START_ROW, CFG.START_COL,    numRows, 1).getValues();          // F
+  const ends      = sh.getRange(CFG.DATA_START_ROW, CFG.END_COL,      numRows, 1).getValues();          // G
+
+  const tkRange = sh.getRange(CFG.DATA_START_ROW, CFG.TK_START_COL, numRows, numCols);
+  const bgs = tkRange.getBackgrounds();
+
+  const totals = new Array(numCols).fill(0);
+
+  for (let r = 0; r < numRows; r++) {
+    const startDate = toDate00_(starts[r][0]);
+    const endDate   = toDate00_(ends[r][0]);
+    if (!startDate || !endDate) continue;
+
+    // N7 должен быть внутри периода
+    if (selectedDate.getTime() < startDate.getTime()) continue;
+    if (selectedDate.getTime() > endDate.getTime()) continue;
+
+    const effStatus = effectiveStatusOnDate_(statuses[r][0], startDate, endDate, selectedDate);
+    if (effStatus === CFG.STATUS_DONE) continue; // на выбранную дату считаем "завершено" неактивным
+
+    const sec = toNumber_(durations[r][0]);
+    if (!(sec > 0)) continue;
+
+    for (let c = 0; c < numCols; c++) {
+      if (isGreen_(bgs[r][c])) totals[c] += sec;
+    }
+  }
+
+  sh.getRange(CFG.TOTALS_ROW, CFG.TK_START_COL, 1, numCols).setValues([totals]);
+}
+
+function clearTotalsRow_(sh) {
+  const numCols = CFG.TK_END_COL - CFG.TK_START_COL + 1;
+  sh.getRange(CFG.TOTALS_ROW, CFG.TK_START_COL, 1, numCols).clearContent();
+}
+
+/**
+ * ==========================
+ * Эффективный статус на дату
+ * ==========================
+ * Приоритет:
+ * 1) Если статус в E один из {запланировано, опубликовано, завершено} — используем его
+ * 2) Иначе вычисляем по датам:
+ *    - date < start  => запланировано
+ *    - start..end   => опубликовано
+ *    - date > end   => завершено
+ */
+function effectiveStatusOnDate_(rawStatus, startDate, endDate, date) {
+  const st = normalizeStatus_(rawStatus);
+
+  if (st === CFG.STATUS_PLANNED || st === CFG.STATUS_PUBLISHED || st === CFG.STATUS_DONE) {
+    return st;
+  }
+
+  if (date.getTime() < startDate.getTime()) return CFG.STATUS_PLANNED;
+  if (date.getTime() > endDate.getTime()) return CFG.STATUS_DONE;
+  return CFG.STATUS_PUBLISHED;
+}
+
+/**
+ * ==========================
+ * ВСПОМОГАТЕЛЬНЫЕ
+ * ==========================
+ */
+function normalizeStatus_(s) {
+  return (s || '').toString().trim().toLowerCase();
+}
+
+function isGreen_(hex) {
+  if (!hex) return false;
+  const h = String(hex).trim().toLowerCase();
+  return CFG.GREEN_HEXES.some(g => h === String(g).trim().toLowerCase());
+}
+
+function toNumber_(v) {
+  if (typeof v === 'number') return v;
+  if (v === null || v === undefined) return 0;
+  const n = Number(String(v).replace(',', '.').trim());
+  return isNaN(n) ? 0 : n;
+}
+
+/**
+ * Надёжное приведение к дате 00:00:00:
+ * - принимает Date из Sheets
+ * - парсит строки вида "21.1.26", "21.01.2026", "21.01.26"
+ */
+function toDate00_(v) {
+  if (!v && v !== 0) return null;
+
+  // Sheets Date
+  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) {
+    const d = new Date(v);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  const s = String(v).trim();
+  if (!s) return null;
+
+  // dd.mm.yyyy или dd.mm.yy (разделители . / - / /)
+  const m = s.match(/^(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{2}|\d{4})$/);
+  if (m) {
+    const dd = parseInt(m[1], 10);
+    const mm = parseInt(m[2], 10);
+    let yy = parseInt(m[3], 10);
+    if (yy < 100) yy += 2000; // 26 -> 2026
+    const d = new Date(yy, mm - 1, dd);
+    if (!isNaN(d.getTime())) {
+      d.setHours(0, 0, 0, 0);
+      return d;
+    }
+  }
+
+  // fallback: ISO/другие форматы
+  const d2 = new Date(s);
+  if (!isNaN(d2.getTime())) {
+    d2.setHours(0, 0, 0, 0);
+    return d2;
+  }
+
+  return null;
+}
