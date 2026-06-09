@@ -53,6 +53,91 @@ function highlightCampaigns(campaignData) {
   }
 }
 
+/**
+ * Подсчёт секунд по строке 2 для каждого ТК (R–GN).
+ * Суммирует столбец C для строк, где:
+ *   — ячейка ТК закрашена зелёным (#00ff00)
+ *   — дата из N7 попадает в диапазон [Дата старта (F) .. Дата окончания (G)]
+ *   — Статус (E) = "опубликовано" или "запланировано"
+ * Записывает результат в строку 2 (R2:GN2).
+ * Можно запускать вручную или по триггеру (например, каждый час).
+ */
+function calculateTKSeconds() {
+  var spreadsheetId = "17VeQQWTGotofrpNbUHDhUFhCc3qjLdwoesTxDDfJ7h4";
+  var ss = SpreadsheetApp.openById(spreadsheetId);
+  var sheet = ss.getSheets()[0];
+
+  // Целевая дата из N7
+  var targetDateRaw = sheet.getRange("N7").getValue();
+  if (!(targetDateRaw instanceof Date) || isNaN(targetDateRaw.getTime())) {
+    Logger.log("Ошибка: ячейка N7 не содержит корректную дату.");
+    return { status: 'error', message: 'N7 не содержит дату' };
+  }
+  // Нормализуем до полуночи, чтобы сравнивать только по дням
+  var target = new Date(targetDateRaw.getFullYear(), targetDateRaw.getMonth(), targetDateRaw.getDate());
+
+  var lastRow = sheet.getLastRow();
+  var startRow = 3; // Данные кампаний начинаются с 3-й строки
+
+  if (lastRow < startRow) {
+    Logger.log("Нет данных для обработки.");
+    return { status: 'ok', message: 'Нет строк' };
+  }
+
+  var numRows = lastRow - startRow + 1;
+
+  // Колонки ТК: R=18 .. GN=195 (178 колонок)
+  var tkStartCol = 18;
+  var numTKCols = 178;
+
+  // Читаем все нужные данные одним блоком для скорости
+  // Секунды: столбец C (3)
+  var secondsData = sheet.getRange(startRow, 3, numRows, 1).getValues();
+
+  // Статус (E=5), Дата старта (F=6), Дата окончания (G=7) — 3 столбца начиная с E
+  var campaignData = sheet.getRange(startRow, 5, numRows, 3).getValues();
+
+  // Цвета фона для всего блока ТК-колонок
+  var backgrounds = sheet.getRange(startRow, tkStartCol, numRows, numTKCols).getBackgrounds();
+
+  var GREEN = "#00ff00";
+  // Допустимые статусы (в нижнем регистре)
+  var validStatuses = ["опубликовано", "запланировано"];
+
+  var totals = new Array(numTKCols).fill(0);
+
+  for (var row = 0; row < numRows; row++) {
+    var seconds = parseFloat(secondsData[row][0]);
+    if (isNaN(seconds) || seconds <= 0) continue;
+
+    var status = String(campaignData[row][0]).toLowerCase().trim();
+    if (validStatuses.indexOf(status) === -1) continue;
+
+    var rawStart = campaignData[row][1];
+    var rawEnd   = campaignData[row][2];
+    if (!(rawStart instanceof Date) || !(rawEnd instanceof Date)) continue;
+
+    var startDate = new Date(rawStart.getFullYear(), rawStart.getMonth(), rawStart.getDate());
+    var endDate   = new Date(rawEnd.getFullYear(),   rawEnd.getMonth(),   rawEnd.getDate());
+
+    // Дата N7 должна попадать в [startDate, endDate]
+    if (target < startDate || target > endDate) continue;
+
+    // Проверяем каждую ТК-колонку на зелёный цвет
+    for (var col = 0; col < numTKCols; col++) {
+      if (backgrounds[row][col].toLowerCase() === GREEN) {
+        totals[col] += seconds;
+      }
+    }
+  }
+
+  // Записываем результаты в строку 2 (R2:GN2)
+  sheet.getRange(2, tkStartCol, 1, numTKCols).setValues([totals]);
+
+  Logger.log("calculateTKSeconds завершён. Дата: " + target + " | Итого колонок: " + numTKCols);
+  return { status: 'success', date: target.toString() };
+}
+
 function hideFinishedCampaigns() {
   var spreadsheetId = "17VeQQWTGotofrpNbUHDhUFhCc3qjLdwoesTxDDfJ7h4";
   var ss = SpreadsheetApp.openById(spreadsheetId);
@@ -86,15 +171,13 @@ function hideFinishedCampaigns() {
 }
 
 /**
- * Функция для проверки превышения порога в 160 секунд.
- * Запускается триггером или вручную.
+ * Проверка превышения порога 160 секунд в строке 2.
  */
 function checkTKThreshold() {
   var spreadsheetId = "17VeQQWTGotofrpNbUHDhUFhCc3qjLdwoesTxDDfJ7h4";
   var ss = SpreadsheetApp.openById(spreadsheetId);
   var sheet = ss.getSheets()[0];
   
-  // Диапазон R2:GN2 (Строка 2, Колонки 18-195)
   var range = sheet.getRange(2, 18, 1, 178);
   var values = range.getValues()[0];
   var headers = sheet.getRange(1, 18, 1, 178).getValues()[0];
@@ -107,16 +190,24 @@ function checkTKThreshold() {
     }
   }
   
-  if (exceeded.length > 0) {
-    return exceeded;
-  }
-  return null;
+  return exceeded.length > 0 ? exceeded : null;
 }
 
 /**
- * Функция для обработки запросов от бота для проверки порогов
+ * GET-обработчик:
+ *   ?action=calculate  — запускает подсчёт секунд и возвращает результат
+ *   (по умолчанию)     — проверяет превышение порога 160 с
  */
 function doGet(e) {
+  var action = e && e.parameter && e.parameter.action;
+
+  if (action === 'calculate') {
+    var result = calculateTKSeconds();
+    return ContentService.createTextOutput(JSON.stringify(result))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // По умолчанию — проверка порогов
   var exceeded = checkTKThreshold();
   return ContentService.createTextOutput(JSON.stringify({
     status: 'success',
