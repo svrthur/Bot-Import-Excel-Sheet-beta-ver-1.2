@@ -406,3 +406,117 @@ function doGet(e) {
   return ContentService.createTextOutput(JSON.stringify({ status: 'success', exceeded: exceeded }))
     .setMimeType(ContentService.MimeType.JSON);
 }
+
+// ─────────────────────────────────────────────
+// ДИАГНОСТИКА — запустите вручную при проблемах с нулями в строке 2
+// ─────────────────────────────────────────────
+
+/**
+ * Запустите эту функцию вручную (▶ Run → debugTKRow2).
+ * Результат смотрите в View → Logs (Ctrl+Enter).
+ * Покажет: имя листа, дату N7, уникальные цвета зелёных ячеек,
+ * статусы и строки, которые участвуют в подсчёте.
+ */
+function debugTKRow2() {
+  // 1. Имя активного листа
+  const ss = SpreadsheetApp.getActive();
+  const sheets = ss.getSheets().map(s => s.getName());
+  Logger.log('Все листы: ' + JSON.stringify(sheets));
+
+  const sh = ss.getSheets()[0]; // берём первый лист независимо от имени
+  Logger.log('Активный лист (используется): ' + sh.getName());
+
+  // 2. Дата в N7
+  const rawN7 = sh.getRange(CFG.DATE_CELL_A1).getValue();
+  const selectedDate = toDate00_(rawN7);
+  Logger.log('N7 raw: ' + rawN7 + ' | parsed: ' + selectedDate);
+  if (!selectedDate) {
+    Logger.log('❌ N7 не распознана как дата — пересчёт невозможен');
+    return;
+  }
+
+  const lastRow = sh.getLastRow();
+  const numRows = lastRow - CFG.DATA_START_ROW + 1;
+  const numCols = CFG.TK_END_COL - CFG.TK_START_COL + 1;
+
+  if (numRows <= 0) {
+    Logger.log('❌ Нет строк данных (DATA_START_ROW=' + CFG.DATA_START_ROW + ', lastRow=' + lastRow + ')');
+    return;
+  }
+
+  // 3. Все уникальные цвета в блоке ТК (первые 50 строк, чтобы не тормозить)
+  const sampleRows = Math.min(numRows, 50);
+  const bgs = sh.getRange(CFG.DATA_START_ROW, CFG.TK_START_COL, sampleRows, numCols).getBackgrounds();
+  const colorSet = {};
+  for (let r = 0; r < sampleRows; r++) {
+    for (let c = 0; c < numCols; c++) {
+      const bg = (bgs[r][c] || '').toLowerCase();
+      if (bg && bg !== '#ffffff' && bg !== 'white' && bg !== '') {
+        colorSet[bg] = (colorSet[bg] || 0) + 1;
+      }
+    }
+  }
+  Logger.log('Уникальные цвета в R..GN (первые 50 строк): ' + JSON.stringify(colorSet));
+  Logger.log('Ожидаемый зелёный: ' + JSON.stringify(CFG.GREEN_HEXES));
+
+  // 4. Строки, которые проходят все фильтры (покажем первые 10)
+  const durations = sh.getRange(CFG.DATA_START_ROW, CFG.DURATION_COL, numRows, 1).getValues();
+  const statuses  = sh.getRange(CFG.DATA_START_ROW, CFG.STATUS_COL,   numRows, 1).getDisplayValues();
+  const starts    = sh.getRange(CFG.DATA_START_ROW, CFG.START_COL,    numRows, 1).getValues();
+  const ends      = sh.getRange(CFG.DATA_START_ROW, CFG.END_COL,      numRows, 1).getValues();
+  const allBgs    = sh.getRange(CFG.DATA_START_ROW, CFG.TK_START_COL, numRows, numCols).getBackgrounds();
+
+  let passDate = 0, passStatus = 0, passGreen = 0, shown = 0;
+
+  for (let r = 0; r < numRows; r++) {
+    const startDate = toDate00_(starts[r][0]);
+    const endDate   = toDate00_(ends[r][0]);
+    if (!startDate || !endDate) continue;
+
+    if (selectedDate < startDate || selectedDate > endDate) continue;
+    passDate++;
+
+    const effStatus = effectiveStatusOnDate_(statuses[r][0], startDate, endDate, selectedDate);
+    if (effStatus === CFG.STATUS_DONE) continue;
+    passStatus++;
+
+    // Есть ли хоть одна зелёная ячейка в строке?
+    const hasGreen = allBgs[r].some(bg => isGreen_(bg));
+    if (hasGreen) {
+      passGreen++;
+      if (shown < 10) {
+        Logger.log(
+          '✅ Строка ' + (CFG.DATA_START_ROW + r) +
+          ' | статус: "' + statuses[r][0] + '"' +
+          ' | эфф.статус: "' + effStatus + '"' +
+          ' | секунды: ' + durations[r][0] +
+          ' | F=' + starts[r][0] + ' G=' + ends[r][0]
+        );
+        shown++;
+      }
+    }
+  }
+
+  Logger.log('─────────────────────────────');
+  Logger.log('Строк прошли фильтр по дате:   ' + passDate);
+  Logger.log('Строк прошли фильтр по статусу: ' + passStatus);
+  Logger.log('Строк с зелёными ячейками:      ' + passGreen);
+
+  if (passGreen === 0) {
+    if (passDate === 0) {
+      Logger.log('❌ Никакая строка не попадает в диапазон дат N7=' + selectedDate);
+    } else if (passStatus === 0) {
+      Logger.log('❌ Все строки отфильтрованы по статусу — проверьте значения столбца E');
+      Logger.log('   Примеры статусов из таблицы:');
+      const sample = new Set();
+      for (let r = 0; r < Math.min(numRows, 100); r++) {
+        sample.add('"' + String(statuses[r][0]).trim() + '"');
+        if (sample.size >= 10) break;
+      }
+      Logger.log('   ' + Array.from(sample).join(', '));
+    } else {
+      Logger.log('❌ Нет зелёных ячеек — или цвет не совпадает с GREEN_HEXES');
+      Logger.log('   Добавьте в CFG.GREEN_HEXES нужный цвет из списка выше');
+    }
+  }
+}
